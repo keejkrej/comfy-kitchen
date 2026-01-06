@@ -106,25 +106,36 @@ def quantize_nvfp4(
     return data_lp, blocked_scales
 
 
+E2M1_LUT = torch.tensor([
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+]).unsqueeze(1)
+
+E2M1_LUT_CACHE = {}
+
+
 def dequantize_nvfp4(
     qx: torch.Tensor,
     per_tensor_scale: torch.Tensor,
     block_scales: torch.Tensor,
     output_type: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    # Unpack FP4 data
-    data_unpacked = unpack_uint4(qx)  # Returns unpacked uint8 values
+    lut = E2M1_LUT_CACHE.get((qx.device, output_type))
+    if lut is None:
+        lut = E2M1_LUT.to(qx.device, output_type)
+        E2M1_LUT_CACHE[(qx.device, output_type)] = lut
 
-    # Convert unpacked FP4 to float32
-    # The unpacked values are in E2M1 format (2 exponent bits, 1 mantissa bit)
-    data_f32 = _floatx_unpacked_to_f32(data_unpacked, ebits=2, mbits=1)
+    lo = qx & 0x0F
+    hi = qx >> 4
+    out = torch.stack([hi, lo], dim=-1).view(*qx.shape[:-1], -1)
+    out = torch.nn.functional.embedding(out.int(), lut).squeeze(-1)
 
     # Get original shape (packed tensor has half the columns)
-    orig_shape = data_f32.shape
+    orig_shape = out.shape
     block_size = 16
 
     # Reshape to blocks for scaling
-    data_reshaped = data_f32.reshape(orig_shape[0], -1, block_size)
+    out = out.reshape(orig_shape[0], -1, block_size)
 
     # Unswizzle block_scales from cuBLAS tiled layout
     # The scales are in (RoundUp(num_rows, 128), RoundUp(num_cols//16, 4)) format
@@ -139,10 +150,10 @@ def dequantize_nvfp4(
     )
 
     # Compute total decode scale: per_tensor_scale * block_scale_fp8
-    total_scale = per_tensor_scale * block_scales_unswizzled.to(torch.float32)
+    total_scale = per_tensor_scale.to(output_type) * block_scales_unswizzled.to(output_type)
 
     # Apply scaling to dequantize
-    data_dequantized = data_reshaped * total_scale.unsqueeze(-1)
+    data_dequantized = out * total_scale.unsqueeze(-1)
 
     # Reshape back to original shape and convert to output type
     result = data_dequantized.view(orig_shape).to(output_type)
